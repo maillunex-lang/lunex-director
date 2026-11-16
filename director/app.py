@@ -14,7 +14,7 @@ import time
 import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
-from director import observer
+from director import observer, review
 
 REPO=os.environ.get("DIRECTOR_REPOSITORY","maillunex-lang/LunexEconom")
 DB_PATH=Path(os.environ.get("DIRECTOR_DB","./director.sqlite3"))
@@ -24,7 +24,7 @@ ADMIN_PASSWORD=os.environ.get("DIRECTOR_ADMIN_PASSWORD","")
 GITHUB_TOKEN=os.environ.get("DIRECTOR_GITHUB_TOKEN","")
 SESSIONS={}
 LOCK=threading.Lock()
-STYLE=""":root{color-scheme:dark;font-family:system-ui,Arial;background:#0c1c17;color:#eaf5ef}*{box-sizing:border-box}body{margin:0}main{max-width:1024px;margin:auto;padding:20px}h1{font-size:1.4rem}a{color:#9de8ba}nav{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0}nav a,button{display:inline-block;background:#256444;color:#fff;border:0;border-radius:9px;padding:12px;text-decoration:none;font:inherit;cursor:pointer}.card{background:#183127;border:1px solid #3c574a;border-radius:13px;padding:16px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}.grid .card{margin:0}input,textarea,select{width:100%;background:#10261d;color:#fff;border:1px solid #527761;border-radius:8px;padding:12px;font:inherit;margin:8px 0 14px}textarea{min-height:160px}small{color:#adbbb0}.warn{color:#ffcf91}li{margin:10px 0}button:focus-visible,input:focus-visible{outline:2px solid #e2df75}"""
+STYLE=""":root{color-scheme:dark;font-family:system-ui,Arial;background:#0c1c17;color:#eaf5ef}*{box-sizing:border-box}body{margin:0}main{max-width:1024px;margin:auto;padding:20px}h1{font-size:1.4rem}a{color:#9de8ba}nav{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0}nav a,button{display:inline-block;background:#256444;color:#fff;border:0;border-radius:9px;padding:12px;text-decoration:none;font:inherit;cursor:pointer}.card{background:#183127;border:1px solid #3c574a;border-radius:13px;padding:16px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}.grid .card{margin:0}input,textarea,select{width:100%;background:#10261d;color:#fff;border:1px solid #527761;border-radius:8px;padding:12px;font:inherit;margin:8px 0 14px}textarea{min-height:160px}small{color:#adbbb0}.warn{color:#ffcf91}li{margin:10px 0}button:focus-visible,input:focus-visible{outline:2px solid #e2df75}.ok{color:#9de8ba}.bad{color:#ff9f9f}.muted{color:#aabfb1}.pill{display:inline-block;border-radius:18px;padding:5px 10px;background:#254d3b;font-size:.83rem}.card h3{overflow-wrap:anywhere}.card p{overflow-wrap:anywhere}details{margin:12px 0}summary{cursor:pointer;padding:12px;background:#214133;border-radius:9px}.summary{display:flex;flex-wrap:wrap;gap:8px}.summary .card{flex:1;min-width:100px;text-align:center}.actions{display:flex;flex-wrap:wrap;gap:8px}@media(max-width:600px){main{padding:12px}h1{font-size:1.3rem}h2{font-size:1.15rem}nav a,button{padding:10px}li{overflow-wrap:anywhere}}"""
 def e(v): return html.escape(str(v if v is not None else ""),quote=True)
 def utc():return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 def get_conn():
@@ -66,18 +66,30 @@ def render_tasks():
 def render_task(t):
  sel=''.join('<option value="'+k+'"'+(' selected' if t["status"]==k else '')+'>'+v+'</option>' for k,v in [("open","Ожидает"),("in_review","На проверке"),("done","Готово (ручная отметка)"),("blocked","Заблокировано")])
  return layout("Задача",'<a href="/tasks">← Все задачи</a><section class="card"><h2>#'+e(t["id"])+' '+e(t["title"])+'</h2><label>Промпт<textarea id="prompt" readonly>'+e(t["body"])+'</textarea></label><button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'prompt\').value).then(()=>this.textContent=\'Скопировано\')">Копировать промпт</button></section><section class="card"><h2>Отчёт исполнителя</h2><form action="/tasks/'+e(t["id"])+'/report" method="post"><label>Ссылка на PR<input name="pr_url" maxlength="400" value="'+e(t["pr_url"])+'"></label><label>Отчёт<textarea name="report" maxlength="8000">'+e(t["report"])+'</textarea></label><label>Статус<select name="status">'+sel+'</select></label><input type="hidden" name="csrf" value="CSRF_PLACEHOLDER"><button>Сохранить</button></form><p><small>Статус не подтверждает успешный CI и не запускает merge.</small></p></section>')
+def github_link(url,label):
+ return '<a target="_blank" rel="noopener noreferrer" href="'+e(url)+'">'+e(label)+'</a>' if url.startswith("https://github.com/") else e(label)
 def render_github():
  with get_conn() as c: state,monitor,events=observer.read(c)
- if not state:
-  return layout("GitHub",'<section class="card"><h2>Мониторинг запускается</h2><p>Система получает первые данные GitHub. Обновите страницу через несколько секунд.</p><p>Состояние: '+e(monitor["status"])+'</p></section>')
- status='<section class="card"><h2>Автоматический наблюдатель</h2><p>Последняя проверка: '+e(monitor["last_attempt"])+' · последняя успешная: '+e(monitor["last_success"])+'</p><p>Состояние: '+e(monitor["status"])+'</p><small>Обновление каждые 3 минуты, без права изменять GitHub. Проверки носят предварительный характер.</small></section>'
- if monitor["status"]!="ok":status+='<p class="warn">GitHub временно недоступен. Показаны последние сохранённые данные.</p>'
- def link(url,label):
-  return '<a target="_blank" rel="noopener noreferrer" href="'+e(url)+'">'+e(label)+'</a>' if url.startswith("https://github.com/") else e(label)
- prs=''.join('<section class="card"><h3>'+link(p["url"],'#'+str(p["number"])+' '+p["title"])+'</h3><p>Ветка: '+e(p["branch"])+'</p><p>Проверка: '+e(p["review"])+'</p></section>' for p in state["prs"])
- runs=''.join('<li>'+link(r["url"],r["name"])+' · '+e(r["branch"])+' · '+e(r["status"])+' / '+e(r["conclusion"])+'</li>' for r in state["runs"][:12])
- events_html=''.join('<li>'+e(ev["observed_at"])+' · '+e(ev["kind"])+' · '+e(ev["reference"])+' · '+e(ev["summary"])+'</li>' for ev in events)
- return layout("GitHub",status+'<div class="grid"><section class="card">PR открыто: '+str(state["total_open_pr"])+'</section><section class="card">Основная ветка: '+e(state["default_branch"])+'</section></div><h2>Открытые PR</h2>'+(prs or '<p>Открытых PR нет.</p>')+'<h2>Последние CI</h2><ul>'+runs+'</ul><h2>Обнаруженные изменения</h2><ul>'+events_html+'</ul>')
+ if not state:return layout("GitHub",'<section class="card">Мониторинг запускается. Состояние: '+e(monitor["status"])+'</section>')
+ runs=state["runs"]
+ success=sum(r["status"]=="completed" and r["conclusion"]=="success" for r in runs)
+ failed=sum(r["status"]=="completed" and r["conclusion"] not in ("success","neutral") for r in runs)
+ pending=sum(r["status"]!="completed" for r in runs)
+ cards='<div class="summary"><div class="card"><h2 class="ok">'+str(success)+'</h2>Успешно</div><div class="card"><h2>'+str(pending)+'</h2>В работе</div><div class="card"><h2 class="bad">'+str(failed)+'</h2>Ошибки</div></div>'
+ meta='<p class="muted">Последняя проверка: '+e(monitor["last_success"])+' · интервал 3 минуты · CI в последних '+str(len(runs))+' запусках</p>'
+ if monitor["status"]!="ok":meta+='<p class="bad">GitHub временно недоступен. Показаны сохранённые данные.</p>'
+ prs=''.join('<section class="card"><h3>'+github_link(p["url"],'#'+str(p["number"])+' '+p["title"])+'</h3><p class="muted">Ветка: '+e(p["branch"])+'</p><p>'+e(p["review"])+'</p><p><a href="/review/'+str(p["number"])+'">Подробная проверка PR и задание исполнителю</a></p></section>' for p in state["prs"])
+ items=''.join('<li>'+github_link(r["url"],r["name"])+' · '+e(r["branch"])+' · <span class="'+("bad" if review.kind(r["status"],r["conclusion"])=="failure" else "ok" if review.kind(r["status"],r["conclusion"])=="success" else "muted")+'">'+e(review.status_ru(r["status"],r["conclusion"]))+'</span></li>' for r in runs[:15])
+ event_items=''.join('<li>'+e(ev["observed_at"][:16].replace("T"," "))+' · '+e({"ci":"CI","review":"Проверка PR","pr_detected":"Новый PR","pr_commit":"Коммит"}.get(ev["kind"],ev["kind"]))+' · '+e(ev["summary"].replace("completed/success","Успешно").replace("completed/failure","Ошибка").replace("in_progress/None","Выполняется"))+'</li>' for ev in events[:12])
+ return layout("GitHub",'<h2>Контроль проекта</h2>'+cards+meta+'<h2>Открытые PR ('+str(state["total_open_pr"])+')</h2>'+(prs or '<p>Открытых PR нет.</p>')+'<details><summary>Последние CI · '+str(len(runs))+'</summary><ul>'+items+'</ul></details><details><summary>Журнал изменений</summary><ul>'+event_items+'</ul></details><p class="muted">Автоматические слияния отключены. Успешный CI не означает готовность PR к слиянию.</p>')
+def render_review(number):
+ try:result=review.inspect_pr(REPO,number,GITHUB_TOKEN)
+ except Exception:return layout("Проверка PR",'<section class="card"><h2>Не удалось получить подробности</h2><p>Проверьте доступ GitHub или повторите позже.</p></section>')
+ checks=''.join('<li>'+e(c.get("name",""))+' · '+e(review.status_ru(c.get("status"),c.get("conclusion")))+'</li>' for c in result["checks"][:40])
+ paths=''.join('<li>'+e(path)+'</li>' for path in result["files"][:100])
+ draft=e(result["draft"])
+ body='<a href="/github">← Назад к GitHub</a><section class="card"><h2>PR #'+str(number)+' · '+e(result["title"])+'</h2><p>'+github_link(result["url"],"Открыть на GitHub")+'</p><p><strong>Заключение:</strong> '+e(result["decision"])+'</p><p>Файлов: '+str(len(result["files"]))+(' (список неполный)' if result["files_truncated"] else '')+'</p><p class="muted">Проверка выполняется по текущему SHA. Зона файлов без привязанного задания не подтверждена.</p></section><section class="card"><h3>Задание исполнителю</h3><textarea id="review-draft" readonly>'+draft+'</textarea><button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'review-draft\').value).then(()=>this.textContent=\'Скопировано\')">Скопировать замечания</button></section><details><summary>Проверки CI ('+str(len(result["checks"]))+')</summary><ul>'+checks+'</ul></details><details><summary>Изменённые файлы</summary><ul>'+paths+'</ul></details>'
+ return layout("Проверка PR",body)
 def session_id(headers):
  cookies=http.cookies.SimpleCookie()
  try:cookies.load(headers.get("Cookie",""))
@@ -118,6 +130,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
   if path=="/":content=render_dashboard()
   elif path=="/tasks":content=render_tasks()
   elif path=="/github":content=render_github()
+  elif re.fullmatch(r"/review/[0-9]+",path):content=render_review(int(path.split("/")[-1]))
   elif path=="/audit":content=render_audit()
   elif re.fullmatch(r"/tasks/[0-9]+",path):
    with get_conn() as c: t=c.execute("SELECT * FROM tasks WHERE id=?",(int(path.split("/")[-1]),)).fetchone()
