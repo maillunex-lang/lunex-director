@@ -86,11 +86,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
  server_version="LunexDirector/0.1"
  def log_message(self,*args):pass
  def send(self,code,body,ctype="text/html; charset=utf-8"):
+  if ctype.startswith("text/html"):
+   body=body.replace(b'href="/',b'href="/director/').replace(b'action="/',b'action="/director/')
   self.send_response(code)
   for k,v in [("Content-Type",ctype),("Content-Length",str(len(body))),("Cache-Control","no-store"),("X-Content-Type-Options","nosniff"),("X-Frame-Options","DENY"),("Referrer-Policy","no-referrer"),("Content-Security-Policy","default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")]:self.send_header(k,v)
   self.end_headers();self.wfile.write(body)
  def redirect(self,url,cookie=None):
-  self.send_response(303);self.send_header("Location",url);self.send_header("Cache-Control","no-store")
+  self.send_response(303);self.send_header("Location","/director"+url);self.send_header("Cache-Control","no-store")
   if cookie:self.send_header("Set-Cookie",cookie)
   self.end_headers()
  def get_form(self):
@@ -129,14 +131,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
    if ADMIN_PASSWORD and hmac.compare_digest(form.get("password",""),ADMIN_PASSWORD):
     token=secrets.token_urlsafe(32)
     with LOCK:SESSIONS[token]=time.time()+12*3600
-    return self.redirect("/",f"director_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200")
+    return self.redirect("/",f"director_session={token}; HttpOnly; Secure; SameSite=Strict; Path=/director/; Max-Age=43200")
    time.sleep(0.3)
    return self.send(403,layout("Ошибка","<p>Неверный пароль</p>",False))
   if not self.auth():return self.send(401,b"Unauthorized","text/plain")
   if not self.csrf(form):return self.send(403,b"CSRF rejected","text/plain")
   if path=="/logout":
    with LOCK:SESSIONS.pop(self.session,None)
-   return self.redirect("/login","director_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+   return self.redirect("/login","director_session=; HttpOnly; Secure; SameSite=Strict; Path=/director/; Max-Age=0")
   if path=="/tasks":
    title=form.get("title","").strip()[:200];body=form.get("body","").strip()[:8000]
    if not title or not body:return self.send(400,b"Missing title or body","text/plain")
