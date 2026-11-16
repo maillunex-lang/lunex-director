@@ -14,7 +14,7 @@ import time
 import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
-from director import observer, review, tasklink
+from director import observer, review, tasklink, importer
 
 REPO=os.environ.get("DIRECTOR_REPOSITORY","maillunex-lang/LunexEconom")
 DB_PATH=Path(os.environ.get("DIRECTOR_DB","./director.sqlite3"))
@@ -38,7 +38,7 @@ def init_db():
   c.execute("CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY,title TEXT NOT NULL,body TEXT NOT NULL,branch TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'open',created_at TEXT NOT NULL,pr_url TEXT NOT NULL DEFAULT '',report TEXT NOT NULL DEFAULT '')")
   c.execute("CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,ts TEXT,action TEXT,task_id INTEGER,detail TEXT)")
   observer.init_db(c)
-  tasklink.ensure_schema(c)
+  importer.ensure_schema(c)
 def audit(c,action,task_id=None,detail=""):
  c.execute("INSERT INTO audit(ts,action,task_id,detail) VALUES(?,?,?,?)",(utc(),action,task_id,detail[:250]))
 def fetch_repo(path):
@@ -51,22 +51,27 @@ def layout(title,body,auth=True):
  nav='<nav><a href="/">Обзор</a><a href="/tasks">Задания</a><a href="/github">GitHub CI / PR</a><a href="/audit">Журнал</a><form action="/logout" method="post"><input type="hidden" name="csrf" value="CSRF_PLACEHOLDER"><button>Выход</button></form></nav>' if auth else ""
  return ('<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>'+e(title)+' | LUNEX DIRECTOR</title><style>'+STYLE+'</style></head><body><main><h1>⬡ LUNEX DIRECTOR</h1><small>Умный директор · безопасный прототип · GitHub только чтение</small>'+nav+body+'<p><small>Модуль AI и слияние PR пока не включены.</small></p></main></body></html>').encode()
 def task_card(t):
- return '<section class="card"><h3>#'+e(t["id"])+' '+e(t["title"])+'</h3><small>'+e(t["branch"])+' · '+e(t["status"])+'</small><p><a href="/tasks/'+e(t["id"])+'">Открыть промпт →</a></p></section>'
+ return '<section class="card"><h3>#'+e(t["id"])+' '+e(t["title"])+'</h3><small>'+e(t["branch"])+' · '+e(t["status"])+' · '+("GitHub" if t["source"]=="github" else "Вручную")+'</small><p><a href="/tasks/'+e(t["id"])+'">Открыть карточку →</a></p></section>'
 def render_dashboard():
  with get_conn() as c:
   counts=dict((r["status"],r["n"]) for r in c.execute("SELECT status,count(*) n FROM tasks GROUP BY status"))
   tasks=c.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT 8").fetchall()
  cells=''.join('<div class="card"><h2>'+str(counts.get(s,0))+'</h2><small>'+name+'</small></div>' for s,name in [("open","В очереди"),("in_review","На проверке"),("done","Завершено")])
- return layout("Обзор",'<div class="grid">'+cells+'</div><section class="card"><h2>Проект: '+e(REPO)+'</h2><p>Состояние PR и CI проверяется по запросу в разделе GitHub.</p></section><h2>Последние задания</h2>'+''.join(map(task_card,tasks)))
+ return layout("Обзор",'<div class="grid">'+cells+'</div><section class="card"><h2>Проект: '+e(REPO)+'</h2><p>Открытые PR импортируются в задания автоматически после успешной проверки GitHub.</p></section><h2>Последние задания</h2>'+''.join(map(task_card,tasks)))
 def render_audit():
  with get_conn() as c: rows=c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 60").fetchall()
  return layout("Журнал",'<section class="card"><h2>Журнал действий</h2><ul>'+''.join('<li>'+e(r["ts"])+' · '+e(r["action"])+' · задача '+e(r["task_id"])+'</li>' for r in rows)+'</ul></section>')
 def render_tasks():
- with get_conn() as c: rows=c.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT 100").fetchall()
- return layout("Задачи",'<section class="card"><h2>Новое задание</h2><form action="/tasks" method="post"><label>Название<input name="title" maxlength="200" required></label><label>Ветка<input name="branch" maxlength="160"></label><label>Разрешённые файлы (каждый путь или шаблон с новой строки)<textarea name="allowed_files" maxlength="4000" placeholder="server/platform/**"></textarea></label><label>Промпт<textarea name="body" maxlength="8000" required></textarea></label><input name="csrf" type="hidden" value="CSRF_PLACEHOLDER"><button>Создать задачу</button></form></section><h2>Очередь</h2>'+''.join(map(task_card,rows)))
+ with get_conn() as c:
+  rows=c.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT 100").fetchall()
+  state,monitor,_=observer.read(c)
+  imported=c.execute("SELECT count(*) FROM tasks WHERE source='github'").fetchone()[0]
+ banner='<section class="card"><h2>Задания из GitHub</h2><p><strong>'+str(imported)+'</strong> карточек импортировано автоматически. Новые открытые PR добавляются после успешной проверки GitHub (обычно раз в 3 минуты).</p><p class="muted">Промпты и разрешённые зоны не выдумываются. Если исходное задание неизвестно, карточка помечена как неподтверждённая.</p><p>Состояние GitHub: '+e(monitor["status"])+'</p></section>'
+ manual='<details><summary>Расширенные настройки · создать вручную</summary><section class="card"><form action="/tasks" method="post"><label>Название<input name="title" maxlength="200" required></label><label>Ветка<input name="branch" maxlength="160"></label><label>Разрешённые файлы<textarea name="allowed_files" maxlength="4000" placeholder="server/platform/**"></textarea></label><label>Промпт<textarea name="body" maxlength="8000" required></textarea></label><input name="csrf" type="hidden" value="CSRF_PLACEHOLDER"><button>Создать задачу</button></form></section></details>'
+ return layout("Задания",banner+'<h2>Карточки заданий ('+str(len(rows))+')</h2>'+(''.join(map(task_card,rows)) or '<p>Пока заданий нет. Дождитесь следующей успешной проверки GitHub.</p>')+manual)
 def render_task(t):
  sel=''.join('<option value="'+k+'"'+(' selected' if t["status"]==k else '')+'>'+v+'</option>' for k,v in [("open","Ожидает"),("in_review","На проверке"),("done","Готово (ручная отметка)"),("blocked","Заблокировано")])
- return layout("Задача",'<a href="/tasks">← Все задачи</a><section class="card"><h2>#'+e(t["id"])+' '+e(t["title"])+'</h2><label>Промпт<textarea id="prompt" readonly>'+e(t["body"])+'</textarea></label><button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'prompt\').value).then(()=>this.textContent=\'Скопировано\')">Копировать промпт</button></section><section class="card"><h2>Отчёт исполнителя</h2><form action="/tasks/'+e(t["id"])+'/report" method="post"><label>Ссылка на PR<input name="pr_url" maxlength="400" value="'+e(t["pr_url"])+'"></label><label>Отчёт<textarea name="report" maxlength="8000">'+e(t["report"])+'</textarea></label><label>Статус<select name="status">'+sel+'</select></label><input type="hidden" name="csrf" value="CSRF_PLACEHOLDER"><button>Сохранить</button></form><p><small>Статус не подтверждает успешный CI и не запускает merge.</small></p></section>')
+ return layout("Задача",'<a href="/tasks">← Все задачи</a><section class="card"><h2>#'+e(t["id"])+' '+e(t["title"])+'</h2><p class="muted">Источник: '+("GitHub · исходное задание не подтверждено" if t["source"]=="github" else "Вручную")+'</p><p>Зона файлов: '+("не подтверждена" if not t["allowed_files"] else e(t["allowed_files"]))+'</p><label>Промпт<textarea id="prompt" readonly>'+e(t["body"])+'</textarea></label><button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'prompt\').value).then(()=>this.textContent=\'Скопировано\')">Копировать промпт</button></section><section class="card"><h2>Отчёт исполнителя</h2><form action="/tasks/'+e(t["id"])+'/report" method="post"><label>Ссылка на PR<input name="pr_url" maxlength="400" value="'+e(t["pr_url"])+'"></label><label>Отчёт<textarea name="report" maxlength="8000">'+e(t["report"])+'</textarea></label><label>Статус<select name="status">'+sel+'</select></label><input type="hidden" name="csrf" value="CSRF_PLACEHOLDER"><button>Сохранить</button></form><p><small>Статус не подтверждает успешный CI и не запускает merge.</small></p></section>')
 def github_link(url,label):
  return '<a target="_blank" rel="noopener noreferrer" href="'+e(url)+'">'+e(label)+'</a>' if url.startswith("https://github.com/") else e(label)
 def render_github():

@@ -7,6 +7,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from director import importer
 
 POLL_INTERVAL=180
 MAX_EVENTS=300
@@ -62,6 +63,7 @@ def sync(conn,repo,token=""):
   for kind,ref,summary in events:
    conn.execute("INSERT OR IGNORE INTO github_events(observed_at,kind,reference,summary) VALUES(?,?,?,?)",(timestamp,kind,ref,summary))
   conn.execute("INSERT INTO github_snapshots(id,observed_at,payload) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET observed_at=excluded.observed_at,payload=excluded.payload",(timestamp,json.dumps(state,ensure_ascii=False)))
+  importer.import_snapshot(conn,repo,state,timestamp)
   conn.execute("UPDATE github_monitor SET status='ok',last_success=?,error=NULL",(timestamp,))
   conn.execute("DELETE FROM github_events WHERE id NOT IN (SELECT id FROM github_events ORDER BY id DESC LIMIT ?)",(MAX_EVENTS,))
   conn.commit()
