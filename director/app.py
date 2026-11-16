@@ -14,6 +14,7 @@ import time
 import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+from director import observer
 
 REPO=os.environ.get("DIRECTOR_REPOSITORY","maillunex-lang/LunexEconom")
 DB_PATH=Path(os.environ.get("DIRECTOR_DB","./director.sqlite3"))
@@ -36,6 +37,7 @@ def init_db():
   c.execute("PRAGMA journal_mode=WAL")
   c.execute("CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY,title TEXT NOT NULL,body TEXT NOT NULL,branch TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'open',created_at TEXT NOT NULL,pr_url TEXT NOT NULL DEFAULT '',report TEXT NOT NULL DEFAULT '')")
   c.execute("CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,ts TEXT,action TEXT,task_id INTEGER,detail TEXT)")
+  observer.init_db(c)
 def audit(c,action,task_id=None,detail=""):
  c.execute("INSERT INTO audit(ts,action,task_id,detail) VALUES(?,?,?,?)",(utc(),action,task_id,detail[:250]))
 def fetch_repo(path):
@@ -65,17 +67,17 @@ def render_task(t):
  sel=''.join('<option value="'+k+'"'+(' selected' if t["status"]==k else '')+'>'+v+'</option>' for k,v in [("open","Ожидает"),("in_review","На проверке"),("done","Готово (ручная отметка)"),("blocked","Заблокировано")])
  return layout("Задача",'<a href="/tasks">← Все задачи</a><section class="card"><h2>#'+e(t["id"])+' '+e(t["title"])+'</h2><label>Промпт<textarea id="prompt" readonly>'+e(t["body"])+'</textarea></label><button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'prompt\').value).then(()=>this.textContent=\'Скопировано\')">Копировать промпт</button></section><section class="card"><h2>Отчёт исполнителя</h2><form action="/tasks/'+e(t["id"])+'/report" method="post"><label>Ссылка на PR<input name="pr_url" maxlength="400" value="'+e(t["pr_url"])+'"></label><label>Отчёт<textarea name="report" maxlength="8000">'+e(t["report"])+'</textarea></label><label>Статус<select name="status">'+sel+'</select></label><input type="hidden" name="csrf" value="CSRF_PLACEHOLDER"><button>Сохранить</button></form><p><small>Статус не подтверждает успешный CI и не запускает merge.</small></p></section>')
 def render_github():
- try:
-  repo=fetch_repo("")
-  prs=fetch_repo("/pulls?state=open&per_page=30")
-  runs=fetch_repo("/actions/runs?per_page=8").get("workflow_runs",[])
-  def link(url):
-   return '<a target="_blank" rel="noopener noreferrer" href="'+e(url)+'">'+e(url)+'</a>' if url.startswith("https://github.com/") else e(url)
-  p='<ul>'+''.join('<li>'+e(x.get("title"))+' '+link(x.get("html_url",""))+'</li>' for x in prs)+'</ul>'
-  w='<ul>'+''.join('<li>'+e(x.get("name"))+' : '+e(x.get("status"))+' / '+e(x.get("conclusion"))+' '+link(x.get("html_url",""))+'</li>' for x in runs)+'</ul>'
-  return layout("GitHub",'<div class="grid"><section class="card">PR открыто: '+str(len(prs))+'</section><section class="card">Основная ветка: '+e(repo.get("default_branch"))+'</section></div><h2>Pull requests</h2>'+p+'<h2>GitHub Actions</h2>'+w)
- except RuntimeError as exc:
-  return layout("GitHub",'<section class="card"><h2>Пока нет данных GitHub</h2><p class="warn">'+e(exc)+'</p><p>Для приватного репозитория нужен read-only токен, устанавливаемый только в конфигурации сервера.</p></section>')
+ with get_conn() as c: state,monitor,events=observer.read(c)
+ if not state:
+  return layout("GitHub",'<section class="card"><h2>Мониторинг запускается</h2><p>Система получает первые данные GitHub. Обновите страницу через несколько секунд.</p><p>Состояние: '+e(monitor["status"])+'</p></section>')
+ status='<section class="card"><h2>Автоматический наблюдатель</h2><p>Последняя проверка: '+e(monitor["last_attempt"])+' · последняя успешная: '+e(monitor["last_success"])+'</p><p>Состояние: '+e(monitor["status"])+'</p><small>Обновление каждые 3 минуты, без права изменять GitHub. Проверки носят предварительный характер.</small></section>'
+ if monitor["status"]!="ok":status+='<p class="warn">GitHub временно недоступен. Показаны последние сохранённые данные.</p>'
+ def link(url,label):
+  return '<a target="_blank" rel="noopener noreferrer" href="'+e(url)+'">'+e(label)+'</a>' if url.startswith("https://github.com/") else e(label)
+ prs=''.join('<section class="card"><h3>'+link(p["url"],'#'+str(p["number"])+' '+p["title"])+'</h3><p>Ветка: '+e(p["branch"])+'</p><p>Проверка: '+e(p["review"])+'</p></section>' for p in state["prs"])
+ runs=''.join('<li>'+link(r["url"],r["name"])+' · '+e(r["branch"])+' · '+e(r["status"])+' / '+e(r["conclusion"])+'</li>' for r in state["runs"][:12])
+ events_html=''.join('<li>'+e(ev["observed_at"])+' · '+e(ev["kind"])+' · '+e(ev["reference"])+' · '+e(ev["summary"])+'</li>' for ev in events)
+ return layout("GitHub",status+'<div class="grid"><section class="card">PR открыто: '+str(state["total_open_pr"])+'</section><section class="card">Основная ветка: '+e(state["default_branch"])+'</section></div><h2>Открытые PR</h2>'+(prs or '<p>Открытых PR нет.</p>')+'<h2>Последние CI</h2><ul>'+runs+'</ul><h2>Обнаруженные изменения</h2><ul>'+events_html+'</ul>')
 def session_id(headers):
  cookies=http.cookies.SimpleCookie()
  try:cookies.load(headers.get("Cookie",""))
@@ -161,6 +163,7 @@ def main():
  if len(ADMIN_PASSWORD)<16:raise SystemExit("DIRECTOR_ADMIN_PASSWORD must be at least 16 chars")
  if BIND!="127.0.0.1":raise SystemExit("Public binding disabled")
  init_db()
+ observer.start(get_conn,REPO,GITHUB_TOKEN)
  server=http.server.ThreadingHTTPServer((BIND,PORT),Handler)
  print("LUNEX DIRECTOR read-only MVP",BIND,PORT,flush=True)
  server.serve_forever()
