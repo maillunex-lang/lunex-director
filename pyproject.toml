@@ -1,0 +1,8 @@
+[project]
+name = "lunex-director"
+version = "0.1.0"
+description = "Read-only GitHub project director dashboard and task manager"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
