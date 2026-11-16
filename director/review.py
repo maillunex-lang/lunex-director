@@ -27,6 +27,15 @@ def inspect_pr(repo,number,token="",allowed=""):
  files=observer.api(repo,"/pulls/"+str(number)+"/files?per_page=100",token)
  checks=observer.api(repo,"/commits/"+pr["head"]["sha"]+"/check-runs?per_page=100",token).get("check_runs",[])
  runs=observer.api(repo,"/actions/runs?head_sha="+pr["head"]["sha"]+"&per_page=50",token).get("workflow_runs",[])
+ annotations=[]
+ for check in checks[:12]:
+  if check.get("conclusion") in ("failure","timed_out") and check.get("id"):
+   try:
+    items=observer.api(repo,"/check-runs/"+str(check["id"])+"/annotations?per_page=30",token)
+    for a in items[:20]:
+     if a.get("annotation_level") in ("failure","warning"):
+      annotations.append({"path":a.get("path",""),"line":a.get("start_line"),"message":a.get("message","")[:350]})
+   except Exception:pass
  failed_steps=[]
  for r in runs[:8]:
   if r.get("status")=="completed" and r.get("conclusion") not in ("success","neutral"):
@@ -52,6 +61,7 @@ def inspect_pr(repo,number,token="",allowed=""):
  if failed:notes.append("Неуспешные проверки: "+", ".join(x["name"] for x in failed[:12]))
  if pending:notes.append("Выполняются: "+", ".join(pending[:12]))
  if unexpected:notes.append("Вне разрешённой зоны: "+", ".join(unexpected[:20]))
+ if annotations:notes.append("Аннотации GitHub: "+"; ".join(x["path"]+":"+str(x["line"])+" "+x["message"] for x in annotations[:8]))
  if failed_steps:notes.append("Проблемные шаги: "+", ".join(x["job"]+" / "+x["step"] for x in failed_steps[:12]))
  notes.append("Исправить выявленные ошибки, повторно запустить CI и предоставить отчёт. Не сливать PR автоматически.")
- return {"number":number,"title":pr.get("title",""),"url":pr.get("html_url",""),"branch":pr["head"].get("ref",""),"sha":pr["head"]["sha"],"files":paths,"files_truncated":len(files)>=100,"checks":checks,"runs":runs,"failed":failed,"failed_steps":failed_steps,"pending":pending,"scope":scope,"unexpected":unexpected,"decision":decision,"draft":"\n".join(notes)}
+ return {"number":number,"title":pr.get("title",""),"url":pr.get("html_url",""),"branch":pr["head"].get("ref",""),"sha":pr["head"]["sha"],"files":paths,"files_truncated":len(files)>=100,"checks":checks,"runs":runs,"failed":failed,"failed_steps":failed_steps,"annotations":annotations,"pending":pending,"scope":scope,"unexpected":unexpected,"decision":decision,"draft":"\n".join(notes)}

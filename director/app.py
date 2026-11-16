@@ -14,7 +14,7 @@ import time
 import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
-from director import observer, review
+from director import observer, review, tasklink
 
 REPO=os.environ.get("DIRECTOR_REPOSITORY","maillunex-lang/LunexEconom")
 DB_PATH=Path(os.environ.get("DIRECTOR_DB","./director.sqlite3"))
@@ -38,6 +38,7 @@ def init_db():
   c.execute("CREATE TABLE IF NOT EXISTS tasks(id INTEGER PRIMARY KEY,title TEXT NOT NULL,body TEXT NOT NULL,branch TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'open',created_at TEXT NOT NULL,pr_url TEXT NOT NULL DEFAULT '',report TEXT NOT NULL DEFAULT '')")
   c.execute("CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,ts TEXT,action TEXT,task_id INTEGER,detail TEXT)")
   observer.init_db(c)
+  tasklink.ensure_schema(c)
 def audit(c,action,task_id=None,detail=""):
  c.execute("INSERT INTO audit(ts,action,task_id,detail) VALUES(?,?,?,?)",(utc(),action,task_id,detail[:250]))
 def fetch_repo(path):
@@ -62,7 +63,7 @@ def render_audit():
  return layout("Журнал",'<section class="card"><h2>Журнал действий</h2><ul>'+''.join('<li>'+e(r["ts"])+' · '+e(r["action"])+' · задача '+e(r["task_id"])+'</li>' for r in rows)+'</ul></section>')
 def render_tasks():
  with get_conn() as c: rows=c.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT 100").fetchall()
- return layout("Задачи",'<section class="card"><h2>Новое задание</h2><form action="/tasks" method="post"><label>Название<input name="title" maxlength="200" required></label><label>Ветка<input name="branch" maxlength="160"></label><label>Промпт<textarea name="body" maxlength="8000" required></textarea></label><input name="csrf" type="hidden" value="CSRF_PLACEHOLDER"><button>Создать задачу</button></form></section><h2>Очередь</h2>'+''.join(map(task_card,rows)))
+ return layout("Задачи",'<section class="card"><h2>Новое задание</h2><form action="/tasks" method="post"><label>Название<input name="title" maxlength="200" required></label><label>Ветка<input name="branch" maxlength="160"></label><label>Разрешённые файлы (каждый путь или шаблон с новой строки)<textarea name="allowed_files" maxlength="4000" placeholder="server/platform/**"></textarea></label><label>Промпт<textarea name="body" maxlength="8000" required></textarea></label><input name="csrf" type="hidden" value="CSRF_PLACEHOLDER"><button>Создать задачу</button></form></section><h2>Очередь</h2>'+''.join(map(task_card,rows)))
 def render_task(t):
  sel=''.join('<option value="'+k+'"'+(' selected' if t["status"]==k else '')+'>'+v+'</option>' for k,v in [("open","Ожидает"),("in_review","На проверке"),("done","Готово (ручная отметка)"),("blocked","Заблокировано")])
  return layout("Задача",'<a href="/tasks">← Все задачи</a><section class="card"><h2>#'+e(t["id"])+' '+e(t["title"])+'</h2><label>Промпт<textarea id="prompt" readonly>'+e(t["body"])+'</textarea></label><button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'prompt\').value).then(()=>this.textContent=\'Скопировано\')">Копировать промпт</button></section><section class="card"><h2>Отчёт исполнителя</h2><form action="/tasks/'+e(t["id"])+'/report" method="post"><label>Ссылка на PR<input name="pr_url" maxlength="400" value="'+e(t["pr_url"])+'"></label><label>Отчёт<textarea name="report" maxlength="8000">'+e(t["report"])+'</textarea></label><label>Статус<select name="status">'+sel+'</select></label><input type="hidden" name="csrf" value="CSRF_PLACEHOLDER"><button>Сохранить</button></form><p><small>Статус не подтверждает успешный CI и не запускает merge.</small></p></section>')
@@ -83,12 +84,17 @@ def render_github():
  event_items=''.join('<li>'+e(ev["observed_at"][:16].replace("T"," "))+' · '+e({"ci":"CI","review":"Проверка PR","pr_detected":"Новый PR","pr_commit":"Коммит"}.get(ev["kind"],ev["kind"]))+' · '+e(ev["summary"].replace("completed/success","Успешно").replace("completed/failure","Ошибка").replace("in_progress/None","Выполняется"))+'</li>' for ev in events[:12])
  return layout("GitHub",'<h2>Контроль проекта</h2>'+cards+meta+'<h2>Открытые PR ('+str(state["total_open_pr"])+')</h2>'+(prs or '<p>Открытых PR нет.</p>')+'<details><summary>Последние CI · '+str(len(runs))+'</summary><ul>'+items+'</ul></details><details><summary>Журнал изменений</summary><ul>'+event_items+'</ul></details><p class="muted">Автоматические слияния отключены. Успешный CI не означает готовность PR к слиянию.</p>')
 def render_review(number):
- try:result=review.inspect_pr(REPO,number,GITHUB_TOKEN)
+ try:
+  result=review.inspect_pr(REPO,number,GITHUB_TOKEN)
+  with get_conn() as c:task,match_type=tasklink.match_task(c,REPO,number,result["branch"])
+  if task:result=review.inspect_pr(REPO,number,GITHUB_TOKEN,task["allowed_files"])
  except Exception:return layout("Проверка PR",'<section class="card"><h2>Не удалось получить подробности</h2><p>Проверьте доступ GitHub или повторите позже.</p></section>')
  checks=''.join('<li>'+e(c.get("name",""))+' · '+e(review.status_ru(c.get("status"),c.get("conclusion")))+'</li>' for c in result["checks"][:40])
  paths=''.join('<li>'+e(path)+'</li>' for path in result["files"][:100])
  draft=e(result["draft"])
- body='<a href="/github">← Назад к GitHub</a><section class="card"><h2>PR #'+str(number)+' · '+e(result["title"])+'</h2><p>'+github_link(result["url"],"Открыть на GitHub")+'</p><p><strong>Заключение:</strong> '+e(result["decision"])+'</p><p>Файлов: '+str(len(result["files"]))+(' (список неполный)' if result["files_truncated"] else '')+'</p><p class="muted">Проверка выполняется по текущему SHA. Зона файлов без привязанного задания не подтверждена.</p></section><section class="card"><h3>Задание исполнителю</h3><textarea id="review-draft" readonly>'+draft+'</textarea><button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'review-draft\').value).then(()=>this.textContent=\'Скопировано\')">Скопировать замечания</button></section><details><summary>Проверки CI ('+str(len(result["checks"]))+')</summary><ul>'+checks+'</ul></details><details><summary>Изменённые файлы</summary><ul>'+paths+'</ul></details>'
+ linked='<p><strong>Задание:</strong> <a href="/tasks/'+str(task["id"])+'">'+e(task["title"])+'</a> (связь: '+("PR" if match_type=="explicit" else "ветка")+')</p>' if task else '<p class="warn">Задание не найдено однозначно. Создайте его с точной веткой или ссылкой PR. Зона файлов не подтверждена.</p>'
+ scope_label={"within":"В пределах разрешённой зоны","outside":"Обнаружены файлы вне зоны","unknown":"Не задана или не подтверждена"}.get(result["scope"],"Неизвестно")
+ body='<a href="/github">← Назад к GitHub</a><section class="card"><h2>PR #'+str(number)+' · '+e(result["title"])+'</h2><p>'+github_link(result["url"],"Открыть на GitHub")+'</p>'+linked+'<p><strong>Заключение:</strong> '+e(result["decision"])+'</p><p><strong>Зона файлов:</strong> '+e(scope_label)+'</p><p>Файлов: '+str(len(result["files"]))+(' (список неполный)' if result["files_truncated"] else '')+'</p><p class="muted">Проверка текущего SHA, автоматическое слияние отключено.</p></section><section class="card"><h3>Задание исполнителю</h3><textarea style="min-height:290px" id="review-draft" readonly>'+draft+'</textarea><button type="button" onclick="navigator.clipboard.writeText(document.getElementById(\'review-draft\').value).then(()=>this.textContent=\'Скопировано\')">Скопировать замечания</button></section><details><summary>Проверки CI ('+str(len(result["checks"]))+')</summary><ul>'+checks+'</ul></details><details><summary>Изменённые файлы</summary><ul>'+paths+'</ul></details>'
  return layout("Проверка PR",body)
 def session_id(headers):
  cookies=http.cookies.SimpleCookie()
@@ -158,7 +164,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
    title=form.get("title","").strip()[:200];body=form.get("body","").strip()[:8000]
    if not title or not body:return self.send(400,b"Missing title or body","text/plain")
    with get_conn() as c:
-    cur=c.execute("INSERT INTO tasks(title,body,branch,created_at) VALUES(?,?,?,?)",(title,body,form.get("branch","")[:160],utc()))
+    cur=c.execute("INSERT INTO tasks(title,body,branch,created_at,allowed_files) VALUES(?,?,?,?,?)",(title,body,form.get("branch","")[:160],utc(),form.get("allowed_files","")[:4000]))
     audit(c,"task_created",cur.lastrowid)
    return self.redirect("/tasks")
   m=re.fullmatch(r"/tasks/([0-9]+)/report",path)
